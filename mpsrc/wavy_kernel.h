@@ -33,7 +33,7 @@
 #    elif defined(__FreeBSD__) || defined(__NetBSD__)
 #      define MP_WAVY_KERNEL kqueue
 #    elif defined(__sun__)
-#      error Solaris Event Port is not supported. FIXME. mpsrc/wavy_kernel_eventport.cc
+#      define MP_WAVY_KERNEL eventport
 #    else
 #      error This OS is not supported. FIXME. mpsrc/wavy_kernel_select.cc
 #    endif
