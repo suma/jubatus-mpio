@@ -59,6 +59,7 @@ public:
 		}
 
 		memset(m_xident, 0, sizeof(m_xident));
+		memset(m_ptr, 0, sizeof(m_ptr));
 		m_xident_index = 0;
 	}
 
@@ -93,22 +94,16 @@ private:
 		return xident;
 	}
 
+	void set_xident_ptr(int xident, uintptr_t ptr) {
+		if(xident >= 0) {
+			m_ptr[xident - m_fdmax] = ptr;
+		}
+	}
+
 	void set_xident(int xident, int fd) {
 		if(xident >= 0) {
 			m_fds[xident - m_fdmax] = fd;
 		}
-	}
-
-	int find_xident(int fd) {
-		if(fd < 0) {
-			return -1;
-		}
-		for(unsigned int i=0; i < MP_WAVY_KERNEL_EVPORT_XIDENT_MAX; ++i) {
-			if(m_fds[i] == fd) {
-				return i + m_fdmax;
-			}
-		}
-		return -1;
 	}
 
 	int xident_fd(int xident) const {
@@ -118,6 +113,14 @@ private:
 		}
 		errno = EMFILE;	// FIXME?
 		return -1;
+	}
+
+	uintptr_t xident_ptr(int xident) const {
+		const int index = xident - m_fdmax;
+		if(0 <= index && index < MP_WAVY_KERNEL_EVPORT_XIDENT_MAX) {
+			return m_ptr[index];
+		}
+		return 0;
 	}
 
 	bool free_xident(int xident)
@@ -150,19 +153,11 @@ private:
 
 	int add_fd(int fd, short event)
 	{
-		int xident = alloc_xident(fd);
-		if(xident < 0) {
-			return -1;
-		}
-		return ::port_associate(m_ep, PORT_SOURCE_FD, fd, event, (void*)xident);
+		return ::port_associate(m_ep, PORT_SOURCE_FD, fd, event, (void*)fd);
 	}
 
 	int remove_fd(int fd, short event)
 	{
-		int xident = find_xident(fd);
-		if(xident > 0) {
-			free_xident(xident);
-		}
 		return ::port_dissociate(m_ep, PORT_SOURCE_FD, fd);
 	}
 
@@ -178,13 +173,9 @@ private:
 		}
 
 		int ident() const { return xident; }
-		timer_t timer_id() const { return id; }
 
 		int activate() {
-			if(::timer_settime(id, 0, &itimer, NULL) < 0) {
-				return -1;
-			}
-			return 0;
+			return ::timer_settime(id, 0, &itimer, NULL);
 		}
 
 	private:
@@ -206,26 +197,19 @@ private:
 		struct sigevent sigev;
 		port_notify_t pn;
 		pn.portnfy_port = m_ep;
-		pn.portnfy_user = tm;
+		pn.portnfy_user = (void*)xident;
 		timer_t timer_id;
 		::memset(&sigev, 0, sizeof(sigev));
 		sigev.sigev_notify = SIGEV_PORT;
 		sigev.sigev_value.sival_ptr = &pn;
-		int fd = timer_create(CLOCK_REALTIME, &sigev, &timer_id);
-		if(fd < 0) {
+		if(timer_create(CLOCK_REALTIME, &sigev, &timer_id)) {
 			free_xident(xident);
-			timer_delete(fd);
+			timer_delete(timer_id);
 			return -1;
 		}
 
-		set_xident(xident, fd);
-
-
-		if(::fcntl(fd, F_SETFL, O_NONBLOCK) < 0) {
-			free_xident(xident);
-			timer_delete(fd);
-			return -1;
-		}
+		set_xident(xident, timer_id);
+		set_xident_ptr(xident, (uintptr_t)tm);
 
 		struct itimerspec itimer;
 		::memset(&itimer, 0, sizeof(itimer));
@@ -245,29 +229,25 @@ private:
 
 		if(tm->activate()) {
 			free_xident(xident);
-			timer_delete(fd);
+			timer_delete(timer_id);
 			tm->xident = -1;
 			return -1;
 		}
 
-		return fd;
+		return xident;
 	}
 
 	int remove_timer(int xident)
 	{
-		int fd = xident_fd(xident);
-		if(fd < 0) {
+		timer_t id = xident_fd(xident);
+		if(id < 0) {
 			return -1;
 		}
-		return timer_delete(fd);
+		return timer_delete(id);
 	}
 
 	static int read_timer(event e)
 	{
-		uint64_t exp;
-		if(read(e.ident(), &exp, sizeof(uint64_t)) <= 0) {
-			return -1;
-		}
 		return 0;
 	}
 
@@ -276,7 +256,6 @@ private:
 		signal() : xident(-1) { }
 		~signal() {
 			if(xident >= 0) {
-				//::close(fd);
 				kern->remove_signal(xident);
 				kern->free_xident(xident);
 			}
@@ -299,28 +278,6 @@ private:
 		}
 
 		// TODO: implemented by port_send(3)
-#if 0
-		sigset_t mask;
-		sigemptyset(&mask);
-		sigaddset(&mask, signo);
-
-		int fd = signalfd(-1, &mask, 0);
-		if(fd < 0) {
-			free_xident(xident);
-			return -1;
-		}
-
-		if(::fcntl(fd, F_SETFL, O_NONBLOCK) < 0) {
-			free_xident(xident);
-			::close(fd);
-			return -1;
-		}
-
-		//if(add_fd(fd, EVKERNEL_READ) < 0) {
-		//	::close(fd);
-		//	return -1;
-		//}
-#endif
 
 		sg->xident = xident;
 		sg->kern = this;
@@ -329,18 +286,11 @@ private:
 
 	int remove_signal(int ident)
 	{
-		// TODO: 
 		return 0;
 	}
 
 	static int read_signal(event e)
 	{
-#if 0
-		signalfd_siginfo info;
-		if(read(e.ident(), &info, sizeof(info)) <= 0) {
-			return -1;
-		}
-#endif
 		return 0;
 	}
 
@@ -386,8 +336,14 @@ private:
 
 	int wait(backlog* result)
 	{
-		uint_t nget = 0;
-		port_getn(m_ep, result->buf, MP_WAVY_KERNEL_BACKLOG_SIZE, &nget, NULL);
+		uint_t nget = 1;
+		if(port_getn(m_ep, result->buf, MP_WAVY_KERNEL_BACKLOG_SIZE, &nget, NULL)) {
+			// For unix portability
+			if(errno == ETIME) {
+				errno = EINTR;
+			}
+			return -1;
+		}
 		return nget;
 	}
 
@@ -396,29 +352,39 @@ private:
 		struct timespec ts;
 		ts.tv_sec  = timeout_msec / 1000;
 		ts.tv_nsec = (timeout_msec % 1000) * 1000000;
-		uint_t nget = 0;
-		port_getn(m_ep, result->buf, MP_WAVY_KERNEL_BACKLOG_SIZE, &nget, &ts);
+		uint_t nget = 1;
+
+		if(port_getn(m_ep, result->buf, MP_WAVY_KERNEL_BACKLOG_SIZE, &nget, &ts)) {
+			// For unix portability
+			if(errno == ETIME) {
+				errno = EINTR;
+			}
+			return -1;
+		}
 		return nget;
 	}
 
 	int reactivate(event e)
 	{
 		switch(e.portev.portev_source) {
-		case PORT_SOURCE_FD:
-			// READ, WRITE
-		{
-			int xident = (int)e.portev.portev_user;
-			free_xident(xident);
-			add_fd(xident_fd(xident), e.portev.portev_events);
-		}
-			break;
+		case PORT_SOURCE_FD: {
+				// READ, WRITE
+				int fd = e.ident();
+				int type = e.portev.portev_events;
+				printf("PORT_SOURCE_FD: fd %d ev %d\n", fd, type);
+				if(type == POLLIN) {
+					return add_fd(e.ident(), POLLIN);
+				} else if(type == POLLOUT) {
+					return add_fd(e.ident(), POLLOUT);
+				}
 
-		case PORT_SOURCE_TIMER:
-		{
-			timer* tm = (timer*)e.portev.portev_user;
-			tm->activate();
-		}
-			break;
+				return -1;
+			}
+
+		case PORT_SOURCE_TIMER: {
+				timer* tm = (timer*)xident_ptr(e.ident());
+				return tm->activate();
+			}
 
 		// TODO: PORT_SOURCE_ALERT(for signal)
 		
@@ -429,12 +395,15 @@ private:
 
 	int remove(event e)
 	{
-		int xident = (int)e.portev.portev_user;
-		int fd = xident_fd(xident);
-		if(fd >= 0){
-			return free_xident(xident);
+		int ident = e.ident();
+		switch(e.portev.portev_source) {
+		case PORT_SOURCE_FD:
+			return ::port_dissociate(m_ep, PORT_SOURCE_FD, ident);
+		case PORT_SOURCE_TIMER:
+			return 0;
+		default:
+			return -1;
 		}
-		return -1;
 	}
 
 private:
@@ -443,6 +412,7 @@ private:
 
 	bool m_xident[MP_WAVY_KERNEL_EVPORT_XIDENT_MAX];
 	int m_fds[MP_WAVY_KERNEL_EVPORT_XIDENT_MAX];
+	uintptr_t m_ptr[MP_WAVY_KERNEL_EVPORT_XIDENT_MAX];
 	unsigned int m_xident_index;
 
 private:
