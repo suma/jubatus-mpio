@@ -54,6 +54,10 @@ public:
 		}
 		m_fdmax = rbuf.rlim_cur;
 
+		for(unsigned int i=0; i < MP_WAVY_KERNEL_EVPORT_XIDENT_MAX; ++i) {
+			m_fds[i] = -1;
+		}
+
 		memset(m_xident, 0, sizeof(m_xident));
 		m_xident_index = 0;
 	}
@@ -83,15 +87,34 @@ private:
 
 	int alloc_xident(int fd) {
 		int xident = alloc_xident();
-		if (xident > 0) {
-			m_fds[xident] = fd;
+		if(xident >= 0) {
+			m_fds[xident - m_fdmax] = fd;
 		}
 		return xident;
 	}
 
+	void set_xident(int xident, int fd) {
+		if(xident >= 0) {
+			m_fds[xident - m_fdmax] = fd;
+		}
+	}
+
+	int find_xident(int fd) {
+		if(fd < 0) {
+			return -1;
+		}
+		for(unsigned int i=0; i < MP_WAVY_KERNEL_EVPORT_XIDENT_MAX; ++i) {
+			if(m_fds[i] == fd) {
+				return i + m_fdmax;
+			}
+		}
+		return -1;
+	}
+
 	int xident_fd(int xident) const {
-		if(0 <= xident && xident < MP_WAVY_KERNEL_EVPORT_XIDENT_MAX) {
-			return m_fds[xident];
+		const int index = xident - m_fdmax;
+		if(0 <= index && index < MP_WAVY_KERNEL_EVPORT_XIDENT_MAX) {
+			return m_fds[index];
 		}
 		errno = EMFILE;	// FIXME?
 		return -1;
@@ -136,7 +159,10 @@ private:
 
 	int remove_fd(int fd, short event)
 	{
-		// TODO: remove xident
+		int xident = find_xident(fd);
+		if(xident > 0) {
+			free_xident(xident);
+		}
 		return ::port_dissociate(m_ep, PORT_SOURCE_FD, fd);
 	}
 
@@ -154,9 +180,17 @@ private:
 		int ident() const { return xident; }
 		timer_t timer_id() const { return id; }
 
+		int activate() {
+			if(::timer_settime(id, 0, &itimer, NULL) < 0) {
+				return -1;
+			}
+			return 0;
+		}
+
 	private:
 		int xident;
 		timer_t id;
+		struct itimerspec itimer;
 		kernel* kern;
 		friend class kernel;
 		timer(const timer&);
@@ -164,25 +198,32 @@ private:
 
 	int add_timer(timer* tm, const timespec* value, const timespec* interval)
 	{
-		struct sigevent sigev;
-		timer_t timer_id;
-		::memset(&sigev, 0, sizeof(sigev));
-		sigev.sigev_notify = SIGEV_PORT;
-		int fd = timer_create(CLOCK_REALTIME, &sigev, &timer_id);
-		if(fd < 0) {
+		int xident = alloc_xident();
+		if(xident < 0) {
 			return -1;
 		}
 
-		int xident = alloc_xident(fd);
-		if(xident < 0) {
-			::close(fd);
+		struct sigevent sigev;
+		port_notify_t pn;
+		pn.portnfy_port = m_ep;
+		pn.portnfy_user = tm;
+		timer_t timer_id;
+		::memset(&sigev, 0, sizeof(sigev));
+		sigev.sigev_notify = SIGEV_PORT;
+		sigev.sigev_value.sival_ptr = &pn;
+		int fd = timer_create(CLOCK_REALTIME, &sigev, &timer_id);
+		if(fd < 0) {
+			free_xident(xident);
+			timer_delete(fd);
 			return -1;
 		}
+
+		set_xident(xident, fd);
 
 
 		if(::fcntl(fd, F_SETFL, O_NONBLOCK) < 0) {
 			free_xident(xident);
-			::close(fd);
+			timer_delete(fd);
 			return -1;
 		}
 
@@ -197,30 +238,28 @@ private:
 			itimer.it_value = itimer.it_interval;
 		}
 
-		if(::timer_settime(timer_id, 0, &itimer, NULL) < 0) {
-			free_xident(xident);
-			::close(fd);
-			return -1;
-		}
-
-
-		if(::port_associate(m_ep, PORT_SOURCE_TIMER, fd, 0, (void*)xident)) {
-			free_xident(xident);
-			::close(fd);
-			return -1;
-		}
-
 		tm->xident = xident;
 		tm->id = timer_id;
+		tm->itimer = itimer;
 		tm->kern = this;
+
+		if(tm->activate()) {
+			free_xident(xident);
+			timer_delete(fd);
+			tm->xident = -1;
+			return -1;
+		}
+
 		return fd;
 	}
 
 	int remove_timer(int xident)
 	{
 		int fd = xident_fd(xident);
-		timer_delete(fd);
-		return port_dissociate(m_ep, PORT_SOURCE_TIMER, fd);
+		if(fd < 0) {
+			return -1;
+		}
+		return timer_delete(fd);
 	}
 
 	static int read_timer(event e)
@@ -375,6 +414,10 @@ private:
 			break;
 
 		case PORT_SOURCE_TIMER:
+		{
+			timer* tm = (timer*)e.portev.portev_user;
+			tm->activate();
+		}
 			break;
 
 		// TODO: PORT_SOURCE_ALERT(for signal)
@@ -388,10 +431,10 @@ private:
 	{
 		int xident = (int)e.portev.portev_user;
 		int fd = xident_fd(xident);
-		if (!free_xident(xident)){
-			return 0;
+		if(fd >= 0){
+			return free_xident(xident);
 		}
-		return port_dissociate(m_ep, e.portev.portev_source, fd);
+		return -1;
 	}
 
 private:
